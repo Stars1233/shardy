@@ -362,25 +362,25 @@ def Sdy_AxisRef : AttrDef<Sdy_Dialect, "AxisRef"> {
     //  "a":(1)3, "a":(2)3 -> false
     bool canCoexist(AxisRefAttr other) const;
 
-    // Returns the largest prefix of this axis that overlaps with `other`, or
-    // `std::nullopt` if the prefix does not exist.
+    // If this axis or sub-axis overlaps with `other`, returns that overlapping
+    // axis or sub-axis, otherwise returns `std::nullopt`.
     //
     // If this axis and `other` can't coexist, returns `std::nullopt` (see
     // AxisRefAttr::canCoexist).
     //
     // For example:
-    //  "a", "a"           -> "a"
-    //  "a":(2)2, "a"      -> "a":(2)2
+    //  "a", "a":(2)2      -> "a":(2)2
     //  "a":(2)2, "a":(2)2 -> "a":(2)2
+    //  "a":(1)4, "a":(2)4 -> "a":(2)2
+    //  "a":(2)4, "a":(1)4 -> "a":(2)2
     //  "a":(1)4, "a":(1)2 -> "a":(1)2
-    //  "a":(2)8, "a":(1)4 -> "a":(2)2
-    //  "a", "b"           -> std::nullopt
-    //  "a":(2)2, "b"      -> std::nullopt
-    //  "a":(1)4, "a":(2)4 -> std::nullopt
+    //  "a":(2)8, "a":(4)2 -> "a":(4)2
+    //  "a":(1)4, "a":(4)2 -> std::nullopt
+    //  "a":(1)2, "a":(4)2 -> std::nullopt
+    //  "a":(1)4, "b":(2)4 -> std::nullopt
     //  "a":(1)2, "a":(1)3 -> std::nullopt
     //  "a":(3)2, "a":(2)3 -> std::nullopt
-    std::optional<AxisRefAttr> getPrefixWithOverlap(
-        AxisRefAttr other, MeshAttr mesh) const;
+    std::optional<AxisRefAttr> getOverlap(AxisRefAttr other) const;
 
     // If there is no overlap between this axis and `other`, return this axis.
     // Otherwise, return the largest prefix of this axis by removing the
@@ -442,26 +442,6 @@ def Sdy_AxisRef : AttrDef<Sdy_Dialect, "AxisRef"> {
     //  "a", "b"           -> std::nullopt
     //  "a":(1)2, "a":(2)4 -> std::nullopt
     std::optional<AxisRefAttr> getGreatestCommonPrefix(AxisRefAttr other) const;
-
-    // Removes the common prefix of this axis and `other` from this axis. If the
-    // two axes do not have common prefix or `other` is greater or equal to this
-    // axis, return `std::nullopt`.
-    //
-    // If this axis and `other` can't coexist, returns `std::nullopt` (see
-    // AxisRefAttr::canCoexist).
-    //
-    // For example:
-    //  "a", "a":(1)4      -> "a":(4)2 (size("a") == 8)
-    //  "a":(1)4, "a":(1)2 -> "a":(2)2
-    //  "a":(2)8, "a":(2)4 -> "a":(8)2
-    //  "a", "b"           -> std::nullopt
-    //  "a", "a"           -> std::nullopt
-    //  "a":(1)4, "a"      -> std::nullopt
-    //  "a":(2)4, "a":(2)8 -> std::nullopt
-    //  "a":(1)2, "a":(2)4 -> std::nullopt
-    //  "a":(1)2, "a":(1)3 -> std::nullopt
-    std::optional<AxisRefAttr> removeCommonPrefix(
-        AxisRefAttr prefix, MeshAttr mesh) const;
 
     // Returns whether this axis-ref can be merged with `other`, i.e., they are
     // consecutive sub-axes of the same full axis and this sub-axis is major to
@@ -932,10 +912,17 @@ def Sdy_OpShardingRule : AttrDef<Sdy_Dialect, "OpShardingRule"> {
     this is mainly for completeness as many ops such as pointwise ops have size
     one dimensions that correspond across operands and results.
 
-    `reduction_factors` contains the indices of factors requiring reduction,
-    such as the contracting dimensions in a dot operation.
-    `need_replication_factors` contains the indices of factors requiring full
-    replication, such as the sorted dimension in a sort operation.
+    **Factor types:**
+    - `reduction_factors` contains the indices of factors requiring reduction,
+      such as the contracting dimensions in a dot operation.
+    - `need_replication_factors` contains the indices of factors requiring full
+      replication, such as the sorted dimension in a sort operation.
+    - `permutation_factors` contains the indices of factors requiring
+      collective-permute if they are sharded, such as the padding dimensions in
+      a pad operation.
+    - All other factors are considered as pass-through factors, i.e., factors
+      that don't require any communication if sharded in the same way across all
+      tensors that are mapped to them.
 
     `is_custom_rule` describes whether this is a rule defined by a user for a
     `stablehlo.custom_call` op. The partitioner doesn't know how to partition
@@ -950,7 +937,8 @@ def Sdy_OpShardingRule : AttrDef<Sdy_Dialect, "OpShardingRule"> {
       operands/results).
     - Rank of each `TensorMappingAttr` matches the rank of the corresponding
       tensor type.
-    - For each group of factors (`reduction_factors`, `need_replication_factors`):
+    - For each group of factors (`reduction_factors`,
+      `need_replication_factors`, `permutation_factors`):
       * Elements must be in range [0, `$factor_sizes`].
       * No duplicate factor indices within each group and across groups.
   }];
@@ -966,6 +954,8 @@ def Sdy_OpShardingRule : AttrDef<Sdy_Dialect, "OpShardingRule"> {
           "factors requiring reduction">:$reduction_factors,
       OptionalArrayRefParameter<"int64_t",
           "factors requiring full replication">:$need_replication_factors,
+      OptionalArrayRefParameter<"int64_t",
+          "factors corresponding to multiple sizes">:$permutation_factors,
       DefaultValuedParameter<"bool", "false",
           "whether the rule is for a stablehlo.custom_call">:$is_custom_rule
   );
@@ -976,8 +966,9 @@ def Sdy_OpShardingRule : AttrDef<Sdy_Dialect, "OpShardingRule"> {
     `` `->` ``
     `(`$result_mappings`)` ``
     custom<FactorSizes>($factor_sizes) ``
-    custom<ReductionFactors>($reduction_factors) ``
-    custom<NeedReplicationFactors>($need_replication_factors) ``
+    custom<FactorsWithType>($reduction_factors, "\"reduction\"") ``
+    custom<FactorsWithType>($need_replication_factors, "\"need_replication\"") ``
+    custom<FactorsWithType>($permutation_factors, "\"permutation\"") ``
     custom<IsCustomRule>($is_custom_rule)
     `>`
   }];
@@ -987,10 +978,11 @@ def Sdy_OpShardingRule : AttrDef<Sdy_Dialect, "OpShardingRule"> {
                      "ArrayRef<TensorMappingAttr>":$operand_mappings,
                      "ArrayRef<TensorMappingAttr>":$result_mappings,
                      "ArrayRef<int64_t>":$reduction_factors,
-                     "ArrayRef<int64_t>":$need_replication_factors), [{
+                     "ArrayRef<int64_t>":$need_replication_factors,
+                     "ArrayRef<int64_t>":$permutation_factors), [{
       return $_get($_ctxt, factor_sizes, operand_mappings, result_mappings,
                    reduction_factors, need_replication_factors,
-                   /*is_custom_rule=*/false);
+                   permutation_factors, /*is_custom_rule=*/false);
     }]>
   ];
 
@@ -1015,24 +1007,35 @@ def Sdy_OpShardingRule : AttrDef<Sdy_Dialect, "OpShardingRule"> {
     // operands come before the results.
     SmallVector<int64_t> getTensorSizes() const;
 
+    // Returns the type of the given `factorIndex`.
+    FactorType getFactorType(int64_t factorIndex) const;
+
+    // Returns true if the `factorIndex` is a pass-through factor.
+    bool isPassThroughFactor(int64_t factorIndex) const;
+
     // Returns true if the `factorIndex` is a reduction factor.
     bool isReductionFactor(int64_t factorIndex) const;
 
     // Returns true if the `factorIndex` is a factor requiring full replication.
     bool isNeedReplicationFactor(int64_t factorIndex) const;
 
+    // Returns true if the `factorIndex` is a permutation factor.
+    bool isPermutationFactor(int64_t factorIndex) const;
+
     // Returns true if the `factorIndex` is a factor in all non-scalar tensors.
     bool isFactorInAllNonScalarTensors(int64_t factorIndex) const;
 
-    // Returns true if the `factorIndex` is a batching factor, which satisfys:
-    // 1. It is not a reduction factor.
-    // 2. It is not a need replication factor.
-    // 3. It is used in all non-scalar tensors.
+    // Returns true if the `factorIndex` is a batching factor, which satisfies:
+    // 1. It is a pass-through factor.
+    // 2. It is used in all non-scalar tensors.
     bool isBatchingFactor(int64_t factorIndex) const;
 
     // Returns a vector of tensor indices that are non-scalar, of all operand
     // and result tensors, the operands come before the results.
     SmallVector<int64_t> getNonScalarTensorIndices() const;
+
+    // Returns a vector of batching factor indices.
+    SmallVector<int64_t> getBatchingFactors() const;
   }];
 }
 

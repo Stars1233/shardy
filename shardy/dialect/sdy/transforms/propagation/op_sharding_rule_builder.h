@@ -29,6 +29,7 @@ limitations under the License.
 #include "mlir/IR/TypeRange.h"
 #include "mlir/Support/LLVM.h"
 #include "shardy/dialect/sdy/ir/dialect.h"
+#include "shardy/dialect/sdy/ir/enums.h"
 
 namespace mlir {
 namespace sdy {
@@ -36,21 +37,6 @@ namespace sdy {
 // Represents a null dimension to indicate that a tensor shouldn't be mapped to
 // a certain factor.
 const int kNullDim = -1;
-
-// Represents the type of a factor.
-enum class FactorType {
-  // The default type, containing the pass-through factors and other unset
-  // factors.
-  kDefault,
-
-  // If we have sharding along reduction dimensions, the partitioner will add
-  // all-reduce operations.
-  kReduction,
-
-  // If we have sharding along a dimension that needs replication, the
-  // partitioner will make this dimension replicated.
-  kNeedReplication,
-};
 
 // The factor mappings that compose a dimension of a tensor.
 struct DimMapping {
@@ -90,7 +76,7 @@ class OpShardingRuleBuilder {
   // Skips operands and results with corresponding dimension `kNullDim`.
   OpShardingRuleBuilder& addFactor(
       ArrayRef<int64_t> operandDims, ArrayRef<int64_t> resultDims,
-      int64_t factorSize, FactorType factorType = FactorType::kDefault);
+      int64_t factorSize, FactorType factorType = FactorType::kPassThrough);
 
   // Same as addFactor above, but updates the same dimension for all operands
   // and results that have rank at least 1.
@@ -98,14 +84,14 @@ class OpShardingRuleBuilder {
   // Useful when creating rules for pointwise ops.
   OpShardingRuleBuilder& addFactor(
       int64_t dim, int64_t factorSize,
-      FactorType factorType = FactorType::kDefault);
+      FactorType factorType = FactorType::kPassThrough);
 
   // Adds a pointwise factor for all dimensions of all operands/results that
   // have rank at least 1. The factor type is determined by `predFactorType`.
   OpShardingRuleBuilder& addPointwise(
       ArrayRef<int64_t> shape,
       std::function<FactorType(int64_t)> getFactorType = [](int64_t) {
-        return FactorType::kDefault;
+        return FactorType::kPassThrough;
       });
 
   // Adds a pointwise factor for all dimensions that satisfy `pred` of all
@@ -114,20 +100,26 @@ class OpShardingRuleBuilder {
   OpShardingRuleBuilder& addPointwiseIf(
       ArrayRef<int64_t> shape, std::function<bool(int64_t)> pred,
       std::function<FactorType(int64_t)> getFactorType = [](int64_t) {
-        return FactorType::kDefault;
+        return FactorType::kPassThrough;
       });
 
-  // Adds a pointwise factor for the matching dimensions and calls
-  // `onMismatchFn` for the mismatching ones. A dimension is matching if (1)
-  // the dimension size in `inShape` and `outShape` is the same, OR (2)
-  // `alwaysAddFactor` is true.
+  // Adds a pointwise factor for each dimension whose size in `inShape` and
+  // `outShape` is the same, and calls `onMismatchFn` on the rest.
   //
   // If `inShape` and `outShape` are empty, this method does nothing.
   OpShardingRuleBuilder& addPointwiseIfDimSizesMatch(
       ArrayRef<int64_t> inShape, ArrayRef<int64_t> outShape,
-      bool alwaysAddFactor = false,
       std::function<void(int64_t dim, OpShardingRuleBuilder& builder)>
           onMismatchFn = [](int64_t dim, OpShardingRuleBuilder& builder) {});
+
+  // Adds a pointwise factor for all dimensions of all operands/results that
+  // have rank at least 1. The factor type is determined by `predFactorType`.
+  //
+  // Each dimension whose size in `inShape` and `outShape` is different, gets a
+  // `mismatchFactorType` factor type.
+  OpShardingRuleBuilder& addPointwiseWithDiffTypeForMismatch(
+      ArrayRef<int64_t> inShape, ArrayRef<int64_t> outShape,
+      FactorType mismatchFactorType);
 
  private:
   void updateFactorType(FactorType factorType, int64_t factorIndex);
@@ -139,8 +131,8 @@ class OpShardingRuleBuilder {
   SmallVector<TensorMapping> operandMappings;
   SmallVector<TensorMapping> resultMappings;
 
-  SmallVector<int64_t> reductionFactors;
-  SmallVector<int64_t> needReplicationFactors;
+  SmallVector<int64_t> reductionFactors, needReplicationFactors,
+      permutationFactors;
 };
 
 // Creates an identity mapping for an op with `numOperands` operands and

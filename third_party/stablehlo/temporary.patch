@@ -1,70 +1,79 @@
-diff --ruN a/stablehlo/stablehlo/conversions/tosa/transforms/StablehloLegalizeToTosa.pdll b/stablehlo/stablehlo/conversions/tosa/transforms/StablehloLegalizeToTosa.pdll
---- stablehlo/stablehlo/conversions/tosa/transforms/StablehloLegalizeToTosa.pdll
-+++ stablehlo/stablehlo/conversions/tosa/transforms/StablehloLegalizeToTosa.pdll
-@@ -16,6 +16,32 @@
- #include "stablehlo/dialect/StablehloOps.td"
+diff --ruN a/stablehlo/stablehlo/conversions/tosa/tests/unary.mlir b/stablehlo/stablehlo/conversions/tosa/tests/unary.mlir
+--- stablehlo/stablehlo/conversions/tosa/tests/unary.mlir
++++ stablehlo/stablehlo/conversions/tosa/tests/unary.mlir
+@@ -123,8 +123,7 @@
  
- // Helper functions.
-+Rewrite changeElementTypeToI1(type: Type) -> Type [{
-+  auto tensorType = llvm::cast<mlir::RankedTensorType>(type);
-+  return RankedTensorType::get(tensorType.getShape(), rewriter.getI1Type());
-+}];
-+
-+Rewrite changeElementTypeToI8(type: Type) -> Type [{
-+  auto tensorType = llvm::cast<mlir::RankedTensorType>(type);
-+  return RankedTensorType::get(tensorType.getShape(), rewriter.getI8Type());
-+}];
-+
-+Rewrite zerosLike(op: Op, type: Type) -> Op [{
-+  auto elementType = llvm::cast<mlir::TensorType>(type).getElementType();
-+  llvm::SmallVector<mlir::Attribute, 4> outputValue;
-+
-+  if (elementType.isF16() || elementType.isF32() || elementType.isBF16()) {
-+    outputValue.push_back(rewriter.getFloatAttr(elementType, 0));
-+  } else {
-+    outputValue.push_back(rewriter.getIntegerAttr(elementType, 0));
-+  }
-+
-+  return rewriter.create<mlir::tosa::ConstOp>(
-+      op->getLoc(), type,
-+      mlir::DenseElementsAttr::get(
-+        llvm::cast<mlir::ShapedType>(type), outputValue));
-+}];
-+
- Rewrite onesLike(op: Op, type: Type) -> Op [{
-   auto elementType = llvm::cast<mlir::TensorType>(type).getElementType();
-   llvm::SmallVector<mlir::Attribute, 4> outputValue;
-@@ -45,11 +71,6 @@
-       op->getLoc(), type,
-       mlir::DenseElementsAttr::get(
-         llvm::cast<mlir::ShapedType>(type), outputValue));
--}];
--
--Rewrite changeElementTypeToI1(type: Type) -> Type [{
--  auto tensorType = llvm::cast<mlir::RankedTensorType>(type);
--  return RankedTensorType::get(tensorType.getShape(), rewriter.getI1Type());
- }];
+ // CHECK-LABEL: @transpose
+ func.func @transpose(%arg0: tensor<1x2x3xf32>) -> tensor<3x2x1xf32> {
+-  // CHECK: %[[VAR0:.*]] = "tosa.const"() <{value = dense<[2, 1, 0]> : tensor<3xi32>}> : () -> tensor<3xi32>
+-  // CHECK: %[[VAR1:.*]] = tosa.transpose %arg0, %[[VAR0]]
++  // CHECK: %[[VAR0:.*]] = tosa.transpose %arg0 {perms = array<i32: 2, 1, 0>}
+   %0 = "stablehlo.transpose"(%arg0) {permutation = array<i64: 2, 1, 0>} : (tensor<1x2x3xf32>) -> tensor<3x2x1xf32>
+   return %0 : tensor<3x2x1xf32>
+ }
+diff --ruN a/stablehlo/stablehlo/conversions/tosa/transforms/StablehloLegalizeToTosa.cpp b/stablehlo/stablehlo/conversions/tosa/transforms/StablehloLegalizeToTosa.cpp
+--- stablehlo/stablehlo/conversions/tosa/transforms/StablehloLegalizeToTosa.cpp
++++ stablehlo/stablehlo/conversions/tosa/transforms/StablehloLegalizeToTosa.cpp
+@@ -458,13 +458,10 @@
+     }
  
- // Nullary ops.
-@@ -134,10 +155,16 @@
-   replace op<stablehlo.minimum>(input0 : Value<_: Tosa_Tensor>,
-                            input1 : Value<_: Tosa_Tensor>)
-      with op<tosa.minimum>(input0, input1);
--Pattern =>
--  replace op<stablehlo.multiply>(input0 : Value<_: Tosa_Tensor>,
--                            input1 : Value<_: Tosa_Tensor>)
--     with op<tosa.mul>(input0, input1) {shift = attr<"0 : i8">};
-+Pattern {
-+  let root = op<stablehlo.multiply>(input0 : Value<inputType: Tosa_Tensor>,
-+                            input1 : Value<_: Tosa_Tensor>);
-+  rewrite root with {
-+    let typei8 = changeElementTypeToI8(inputType);
-+    let zeros = zerosLike(root, typei8);
-+    let mulResult = op<tosa.mul>(input0, input1, zeros) -> (inputType);
-+    replace root with mulResult;
-+  };
+     auto perms = op.getPermutation();
+-    auto type = RankedTensorType::get({static_cast<int64_t>(perms.size())},
+-                                      rewriter.getI32Type());
+     std::vector<int32_t> perms_int32(perms.begin(), perms.end());
+-    auto constOp = rewriter.create<tosa::ConstOp>(
+-        op->getLoc(), type, DenseIntElementsAttr::get(type, perms_int32));
+-    rewriter.replaceOpWithNewOp<tosa::TransposeOp>(op, op.getType(),
+-                                                   op.getOperand(), constOp);
++    rewriter.replaceOpWithNewOp<tosa::TransposeOp>(
++        op, op.getType(), op.getOperand(),
++        rewriter.getDenseI32ArrayAttr(perms_int32));
+     return success();
+   }
+ };
+diff --ruN a/stablehlo/stablehlo/tests/ops_stablehlo_bounded_dynamism.mlir b/stablehlo/stablehlo/tests/ops_stablehlo_bounded_dynamism.mlir
+--- stablehlo/stablehlo/tests/ops_stablehlo_bounded_dynamism.mlir
++++ stablehlo/stablehlo/tests/ops_stablehlo_bounded_dynamism.mlir
+@@ -57,7 +57,7 @@
+ // -----
+ 
+ func.func @constant_with_dynamic_shape() -> tensor<1x?xf32, #stablehlo.bounds<?, 5>> {
+-  // expected-error@+2 {{elements literal type must have static shape}}
++  // expected-error@below {{elements literal type must have static shape}}
+   %c = stablehlo.constant dense<1> : tensor<1x?xf32, #stablehlo.bounds<?, 5>>
+   return %c : tensor<1x?xf32, #stablehlo.bounds<?, 5>>
+ }
+diff --ruN a/stablehlo/stablehlo/tests/transforms/stablehlo_legalize_qdq_to_quantized_op.mlir b/stablehlo/stablehlo/tests/transforms/stablehlo_legalize_qdq_to_quantized_op.mlir
+--- stablehlo/stablehlo/tests/transforms/stablehlo_legalize_qdq_to_quantized_op.mlir
++++ stablehlo/stablehlo/tests/transforms/stablehlo_legalize_qdq_to_quantized_op.mlir
+@@ -127,3 +127,15 @@
+     %4 = stablehlo.uniform_quantize %3 : (tensor<16x16xf32>) -> tensor<16x16x!quant.uniform<ui8:f32, 34.0:16>>
+     func.return %4: tensor<16x16x!quant.uniform<ui8:f32, 34.0:16>>
+ }
++
++// -----
++
++// CHECK-LABEL @failed_to_match_zero_defining_op
++// CHECK{LITERAL}: %cst = stablehlo.constant dense<0.000000e+00> : tensor<2xf32>
++// CHECK-NEXT: %0 = stablehlo.uniform_quantize %cst : (tensor<2xf32>) -> tensor<2x!quant.uniform<u8:f32, 3.400000e+01:16>>
++// CHECK-NEXT: return %0 : tensor<2x!quant.uniform<u8:f32, 3.400000e+01:16>>
++func.func @failed_to_match_zero_defining_op() -> tensor<2x!quant.uniform<u8:f32, 3.400000e+01:16>> {
++  %0 = stablehlo.constant dense<0.000000e+00> : tensor<2xf32>
++  %1 = stablehlo.uniform_quantize %0 : (tensor<2xf32>) -> tensor<2x!quant.uniform<u8:f32, 3.400000e+01:16>>
++  return %1 : tensor<2x!quant.uniform<u8:f32, 3.400000e+01:16>>
 +}
- Pattern =>
-   replace op<stablehlo.or>(input0 : Value<_: Tosa_Tensor>,
-                       input1 : Value<_: Tosa_Tensor>)
+diff --ruN a/stablehlo/stablehlo/transforms/StablehloLegalizeQDQToQuantizedOp.cpp b/stablehlo/stablehlo/transforms/StablehloLegalizeQDQToQuantizedOp.cpp
+--- stablehlo/stablehlo/transforms/StablehloLegalizeQDQToQuantizedOp.cpp
++++ stablehlo/stablehlo/transforms/StablehloLegalizeQDQToQuantizedOp.cpp
+@@ -63,6 +63,10 @@
+ 
+     // Collect quantized operands and result types to rewrite.
+     // All operands and results must be quantized
++    if (computeOp->getNumOperands() == 0)
++      return rewriter.notifyMatchFailure(computeOp,
++                                         "requires non empty operands");
++
+     llvm::SmallVector<Value> quantizedComputeOpOperands;
+     for (const Value& operand : computeOp->getOperands()) {
+       auto* definingOp = operand.getDefiningOp();
 

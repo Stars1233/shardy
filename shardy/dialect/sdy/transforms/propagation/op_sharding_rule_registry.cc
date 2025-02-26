@@ -37,6 +37,7 @@ limitations under the License.
 #include "mlir/Support/LLVM.h"
 #include "shardy/dialect/sdy/ir/constants.h"
 #include "shardy/dialect/sdy/ir/dialect.h"
+#include "shardy/dialect/sdy/ir/enums.h"
 #include "shardy/dialect/sdy/ir/utils.h"
 #include "shardy/dialect/sdy/transforms/propagation/op_sharding_rule_builder.h"
 #include "stablehlo/dialect/StablehloOps.h"
@@ -184,16 +185,6 @@ OpShardingRuleAttr createOpShardingRule(Operation* op,
           stablehlo::TanhOp, stablehlo::XorOp>([](Operation* pointwiseOp) {
         return OpShardingRuleBuilder::buildPointwise(pointwiseOp);
       })
-      // The following case is for ops that are only pointwise for the sake of
-      // propagation, but would require communication for the result to be
-      // sharded like the operand along a specific dimensions. For example, if
-      // the operand of an `stablehlo::ReverseOp` is sharded along the reverse
-      // dimension, we would want to propagate that sharding to the
-      // corresponding dimension of the result, even though that would require
-      // communication as all elements are needed for sorting.
-      .Case<stablehlo::ReverseOp>([](Operation* pointwiseOp) {
-        return OpShardingRuleBuilder::buildPointwise(pointwiseOp);
-      })
       //===----------------------------------------------------------------===//
       // NOTE: Please keep the order of cases alphabetical.
       //===----------------------------------------------------------------===//
@@ -262,7 +253,7 @@ OpShardingRuleAttr createOpShardingRule(Operation* op,
         // dimensions are decomposition dimensions, which need replication.
         int64_t numBatchDims = shape.size() - 2;
         std::function<FactorType(int64_t)> getFactorType = [&](int64_t dim) {
-          return dim < numBatchDims ? FactorType::kDefault
+          return dim < numBatchDims ? FactorType::kPassThrough
                                     : FactorType::kNeedReplication;
         };
         return OpShardingRuleBuilder(cholesky)
@@ -285,12 +276,14 @@ OpShardingRuleAttr createOpShardingRule(Operation* op,
               // for the concat dimension.
               return !conservativePropagation || dim != concat.getDimension();
             };
+            // TODO(b/396121070): consider giving concat factor kPermutation
+            // under certain conditions, otherwise kNeedReplication.
             std::function<FactorType(int64_t)> getFactorType =
                 [&](int64_t dim) {
-                  // Concat dimension needs replication.
+                  // Concat dimension needs permutation.
                   return dim == concat.getDimension()
-                             ? FactorType::kNeedReplication
-                             : FactorType::kDefault;
+                             ? FactorType::kPermutation
+                             : FactorType::kPassThrough;
                 };
             return OpShardingRuleBuilder(concat)
                 .addPointwiseIf(getTensorShape(concat.getResult()), pred,
@@ -344,21 +337,26 @@ OpShardingRuleAttr createOpShardingRule(Operation* op,
             int64_t numWindows = outType.getDimSize(outDim);
             int64_t windowSize = rhsType.getDimSize(rhsDim);
             int64_t remainingLhsSize = lhsType.getDimSize(lhsDim);
-            auto addSpatialFactor =
-                [&, lhsDim = lhsDim, rhsDim = rhsDim, outDim = outDim](
-                    int64_t factorSize, bool addRhs, bool addOut) {
-                  if (factorSize = std::min(remainingLhsSize, factorSize);
-                      factorSize > 1) {
-                    builder.addFactor({lhsDim, addRhs ? rhsDim : kNullDim},
-                                      addOut ? outDim : kNullDim, factorSize);
-                    remainingLhsSize /= factorSize;
-                  }
-                };
+            auto addSpatialFactor = [&, lhsDim = lhsDim, rhsDim = rhsDim,
+                                     outDim = outDim](int64_t factorSize,
+                                                      bool isContracting) {
+              if (factorSize = std::min(remainingLhsSize, factorSize);
+                  factorSize > 1) {
+                // TODO(tomnatan): A sharded spatial dimension that needs
+                // reduction also needs permutation (halo-swap), so perhaps we
+                // should add combined type or allow having both types.
+                builder.addFactor({lhsDim, isContracting ? rhsDim : kNullDim},
+                                  isContracting ? kNullDim : outDim, factorSize,
+                                  isContracting ? FactorType::kReduction
+                                                : FactorType::kPermutation);
+                remainingLhsSize /= factorSize;
+              }
+            };
             auto addNumWindowsFactor = [&]() {
-              addSpatialFactor(numWindows, /*addRhs=*/false, /*addOut=*/true);
+              addSpatialFactor(numWindows, /*isReduction=*/false);
             };
             auto addWindowSizeFactor = [&]() {
-              addSpatialFactor(windowSize, /*addRhs=*/true, /*addOut=*/false);
+              addSpatialFactor(windowSize, /*isReduction=*/true);
             };
             if (numWindows >= windowSize) {
               addNumWindowsFactor();
@@ -384,7 +382,8 @@ OpShardingRuleAttr createOpShardingRule(Operation* op,
             {dimNums.getInputFeatureDimension(),
              dimNums.getKernelInputFeatureDimension()},
             kNullDim,
-            rhsType.getDimSize(dimNums.getKernelInputFeatureDimension()));
+            rhsType.getDimSize(dimNums.getKernelInputFeatureDimension()),
+            FactorType::kReduction);
 
         // Add the output feature size factor.
         builder.addFactor(
@@ -504,8 +503,7 @@ OpShardingRuleAttr createOpShardingRule(Operation* op,
           return OpShardingRuleBuilder(customCall)
               .addPointwiseIfDimSizesMatch(
                   getTensorShape(customCall.getOperand(0)),
-                  getTensorShape(customCall.getResult(0)),
-                  /*alwaysAddFactor=*/false)
+                  getTensorShape(customCall.getResult(0)))
               .build();
         }
         // TODO(b/327191011): output unregistered op stats instead.
@@ -613,7 +611,6 @@ OpShardingRuleAttr createOpShardingRule(Operation* op,
             return OpShardingRuleBuilder(dynamicUpdateSlice)
                 .addPointwiseIfDimSizesMatch(
                     operandShape, updateShape,
-                    /*alwaysAddFactor=*/false,
                     /*onMismatchFn=*/
                     [&](int64_t dim, OpShardingRuleBuilder& builder) {
                       operandDims[0] = dim;
@@ -658,12 +655,16 @@ OpShardingRuleAttr createOpShardingRule(Operation* op,
       .Case<stablehlo::PadOp>([conservativePropagation](stablehlo::PadOp pad) {
         // If `conservativePropagation` is false, we propagate through padded
         // dimensions, even though that would require communication.
-        return OpShardingRuleBuilder(pad)
-            .addPointwiseIfDimSizesMatch(
-                getTensorShape(pad.getOperand()),
-                getTensorShape(pad.getResult()),
-                /*alwaysAddFactor=*/!conservativePropagation)
-            .build();
+        ArrayRef<int64_t> inShape = getTensorShape(pad.getOperand());
+        ArrayRef<int64_t> outShape = getTensorShape(pad.getResult());
+        OpShardingRuleBuilder builder(pad);
+        if (conservativePropagation) {
+          builder.addPointwiseIfDimSizesMatch(inShape, outShape);
+        } else {
+          builder.addPointwiseWithDiffTypeForMismatch(inShape, outShape,
+                                                      FactorType::kPermutation);
+        }
+        return builder.build();
       })
       .Case<stablehlo::ReduceOp>([](stablehlo::ReduceOp reduce) {
         OpShardingRuleBuilder builder(reduce);
@@ -718,12 +719,18 @@ OpShardingRuleAttr createOpShardingRule(Operation* op,
             // In conservative mode, we only add a factor if the input and
             // output dimension sizes are equal.
             // TODO(tomnatan): should the reduced factor be compound?
-            return OpShardingRuleBuilder(reduceWindow)
-                .addPointwiseIfDimSizesMatch(
-                    getTensorShape(reduceWindow.getResult(0)),
-                    getTensorShape(reduceWindow.getInputs().front()),
-                    /*alwaysAddFactor=*/!conservativePropagation)
-                .build();
+            ArrayRef<int64_t> inShape =
+                getTensorShape(reduceWindow.getInputs().front());
+            ArrayRef<int64_t> outShape =
+                getTensorShape(reduceWindow.getResult(0));
+            OpShardingRuleBuilder builder(reduceWindow);
+            if (conservativePropagation) {
+              builder.addPointwiseIfDimSizesMatch(outShape, inShape);
+            } else {
+              builder.addPointwiseWithDiffTypeForMismatch(
+                  outShape, inShape, FactorType::kPermutation);
+            }
+            return builder.build();
           })
       .Case<stablehlo::ReshapeOp>([](stablehlo::ReshapeOp reshape) {
         RankedTensorType inType = reshape.getOperand().getType();
@@ -834,6 +841,16 @@ OpShardingRuleAttr createOpShardingRule(Operation* op,
 
         return builder.build();
       })
+      .Case<stablehlo::ReverseOp>([](stablehlo::ReverseOp reverse) {
+        std::function<FactorType(int64_t)> getFactorType = [&](int64_t dim) {
+          return llvm::is_contained(reverse.getDimensions(), dim)
+                     ? FactorType::kPermutation
+                     : FactorType::kPassThrough;
+        };
+        return OpShardingRuleBuilder(reverse)
+            .addPointwise(getTensorShape(reverse.getResult()), getFactorType)
+            .build();
+      })
       .Case<stablehlo::ScatterOp>([](stablehlo::ScatterOp scatter) {
         OpShardingRuleBuilder builder(scatter);
 
@@ -868,7 +885,7 @@ OpShardingRuleAttr createOpShardingRule(Operation* op,
                   /*resultDims=*/SmallVector<int64_t>(numInputs, inputDim),
                   factorSize,
                   needReduction ? FactorType::kReduction
-                                : FactorType::kDefault);
+                                : FactorType::kPassThrough);
             });
         return builder.build();
       })
@@ -883,12 +900,18 @@ OpShardingRuleAttr createOpShardingRule(Operation* op,
             // In conservative mode, we only add a factor if the input and
             // source dimension sizes are equal.
             // TODO(tomnatan): should the reduced factor be compound?
-            return OpShardingRuleBuilder(selectAndScatter)
-                .addPointwiseIfDimSizesMatch(
-                    getTensorShape(selectAndScatter.getSource()),
-                    getTensorShape(selectAndScatter.getOperand()),
-                    /*alwaysAddFactor=*/!conservativePropagation)
-                .build();
+            ArrayRef<int64_t> operandShape =
+                getTensorShape(selectAndScatter.getOperand());
+            ArrayRef<int64_t> sourceShape =
+                getTensorShape(selectAndScatter.getSource());
+            OpShardingRuleBuilder builder(selectAndScatter);
+            if (conservativePropagation) {
+              builder.addPointwiseIfDimSizesMatch(sourceShape, operandShape);
+            } else {
+              builder.addPointwiseWithDiffTypeForMismatch(
+                  sourceShape, operandShape, FactorType::kPermutation);
+            }
+            return builder.build();
           })
       .Case<stablehlo::SelectOp>([](stablehlo::SelectOp select) {
         // Case 1: `pred` is a scalar in which case it is broadcasted and must
@@ -910,12 +933,16 @@ OpShardingRuleAttr createOpShardingRule(Operation* op,
             // `conservativePropagation`, and the reason is that for `SliceOp`
             // the start indices are static, so we know how to shift the data
             // to keep the sliced dimension sharded.
-            return OpShardingRuleBuilder(slice)
-                .addPointwiseIfDimSizesMatch(
-                    getTensorShape(slice.getOperand()),
-                    getTensorShape(slice.getResult()),
-                    /*alwaysAddFactor=*/!conservativePropagation)
-                .build();
+            ArrayRef<int64_t> inShape = getTensorShape(slice.getOperand());
+            ArrayRef<int64_t> outShape = getTensorShape(slice.getResult());
+            OpShardingRuleBuilder builder(slice);
+            if (conservativePropagation) {
+              builder.addPointwiseIfDimSizesMatch(inShape, outShape);
+            } else {
+              builder.addPointwiseWithDiffTypeForMismatch(
+                  inShape, outShape, FactorType::kPermutation);
+            }
+            return builder.build();
           })
       .Case<stablehlo::SortOp>([](stablehlo::SortOp sort) {
         ArrayRef<int64_t> shape = getTensorShape(sort.getInputs().front());
@@ -932,7 +959,7 @@ OpShardingRuleAttr createOpShardingRule(Operation* op,
         };
         std::function<FactorType(int64_t)> getFactorType = [&](int64_t dim) {
           return dim == sort.getDimension() ? FactorType::kNeedReplication
-                                            : FactorType::kDefault;
+                                            : FactorType::kPassThrough;
         };
         return OpShardingRuleBuilder(sort)
             .addPointwiseIf(shape, pred, getFactorType)

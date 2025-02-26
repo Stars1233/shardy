@@ -32,6 +32,7 @@ limitations under the License.
 #include "mlir/IR/Types.h"
 #include "mlir/Support/LLVM.h"
 #include "shardy/dialect/sdy/ir/dialect.h"
+#include "shardy/dialect/sdy/ir/enums.h"
 
 namespace mlir {
 namespace sdy {
@@ -117,7 +118,7 @@ OpShardingRuleAttr OpShardingRuleBuilder::build() {
 
   auto result = OpShardingRuleAttr::get(
       context, factorSizes, operandMappingAttrs, resultMappingAttrs,
-      reductionFactors, needReplicationFactors);
+      reductionFactors, needReplicationFactors, permutationFactors);
 
   // Erase all added factors, to return the builder to its original state before
   // calling this method.
@@ -153,7 +154,10 @@ void OpShardingRuleBuilder::updateFactorType(FactorType factorType,
     case FactorType::kNeedReplication:
       needReplicationFactors.push_back(factorIndex);
       return;
-    case FactorType::kDefault:
+    case FactorType::kPermutation:
+      permutationFactors.push_back(factorIndex);
+      return;
+    case FactorType::kPassThrough:
       return;
   }
   llvm_unreachable("unknown FactorType");
@@ -208,17 +212,31 @@ OpShardingRuleBuilder& OpShardingRuleBuilder::addPointwiseIf(
 }
 
 OpShardingRuleBuilder& OpShardingRuleBuilder::addPointwiseIfDimSizesMatch(
-    ArrayRef<int64_t> inShape, ArrayRef<int64_t> outShape, bool alwaysAddFactor,
+    ArrayRef<int64_t> inShape, ArrayRef<int64_t> outShape,
     std::function<void(int64_t dim, OpShardingRuleBuilder& builder)>
         onMismatchFn) {
   for (auto [dim, dimSizes] :
        llvm::enumerate(llvm::zip_equal(inShape, outShape))) {
     auto [inDimSize, outDimSize] = dimSizes;
-    if (alwaysAddFactor || inDimSize == outDimSize) {
+    if (inDimSize == outDimSize) {
       addFactor(dim, inDimSize);
     } else {
       onMismatchFn(dim, *this);
     }
+  }
+  return *this;
+}
+
+OpShardingRuleBuilder&
+OpShardingRuleBuilder::addPointwiseWithDiffTypeForMismatch(
+    ArrayRef<int64_t> inShape, ArrayRef<int64_t> outShape,
+    FactorType mismatchFactorType) {
+  for (auto [dim, dimSizes] :
+       llvm::enumerate(llvm::zip_equal(inShape, outShape))) {
+    auto [inDimSize, outDimSize] = dimSizes;
+    addFactor(dim, inDimSize,
+              inDimSize == outDimSize ? FactorType::kPassThrough
+                                      : mismatchFactorType);
   }
   return *this;
 }

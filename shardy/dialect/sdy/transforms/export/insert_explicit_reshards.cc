@@ -60,6 +60,28 @@ bool hasOverflowAxes(const ShardingProjection& projection) {
   return false;
 }
 
+bool hasShardedPermutationFactorsPerTensor(
+    const TensorFactorShardings& tensorFactorSharding,
+    OpShardingRuleAttr shardingRule) {
+  return llvm::any_of(tensorFactorSharding.factorIndexToSharding,
+                      [&](const auto& factorIndexAndSharding) {
+                        const auto& [factorIndex, factorSharding] =
+                            factorIndexAndSharding;
+                        return !factorSharding.axisRefs.empty() &&
+                               shardingRule.isPermutationFactor(factorIndex);
+                      });
+}
+
+bool hasShardedPermutationFactors(const ShardingProjection& projection,
+                                  OpShardingRuleAttr shardingRule) {
+  return llvm::any_of(llvm::concat<const TensorFactorShardings>(
+                          projection.getOperands(), projection.getResults()),
+                      [&](const TensorFactorShardings& tensorFactorSharding) {
+                        return hasShardedPermutationFactorsPerTensor(
+                            tensorFactorSharding, shardingRule);
+                      });
+}
+
 // Checks if factor sharding is compatible, that is, it satisfies:
 // 1. Factors are sharded the same way across operands and results.
 // 2. Factors that need replication are unsharded.
@@ -464,13 +486,26 @@ SmallVector<AxisListRef> findCommonAxesUsingMajorityVoteHeuristic(
   return factorAxisRefs;
 }
 
-int64_t findTensorIndexToPreferOnUnaryOperation(
+std::optional<int64_t> findTensorIndexToPreferOnUnaryOperation(
     const ShardingProjection& projection, OpShardingRuleAttr shardingRule,
-    MeshAttr mesh) {
+    MeshAttr mesh, const bool hasShardedPermutationFactors) {
   // Find common axes on the larger tensor, hence reshard the smaller tensor.
   SmallVector<int64_t> tensorIndices = shardingRule.getNonScalarTensorIndices();
   const int64_t lhs = tensorIndices[0];
   const int64_t rhs = tensorIndices[1];
+
+  if (hasShardedPermutationFactors) {
+    if (!hasShardedPermutationFactorsPerTensor(projection.getTensor(lhs),
+                                               shardingRule)) {
+      return lhs;
+    }
+    if (!hasShardedPermutationFactorsPerTensor(projection.getTensor(rhs),
+                                               shardingRule)) {
+      return rhs;
+    }
+    // TODO(enver): Handle the case that both have sharded permutation factors.
+    return std::nullopt;
+  }
 
   SmallVector<int64_t> tensorSizes = shardingRule.getTensorSizes();
   if (tensorSizes[lhs] != tensorSizes[rhs]) {
@@ -488,9 +523,16 @@ int64_t findTensorIndexToPreferOnUnaryOperation(
 // Assumes that tensors do not have factors that need replication.
 SmallVector<AxisListRef> findCommonAxesOnUnaryOperation(
     const ShardingProjection& projection, OpShardingRuleAttr shardingRule,
-    MeshAttr mesh) {
-  int64_t tensorIndexToPrefer =
-      findTensorIndexToPreferOnUnaryOperation(projection, shardingRule, mesh);
+    MeshAttr mesh, bool hasShardedPermutationFactors) {
+  std::optional<int64_t> tensorIndexToPrefer =
+      findTensorIndexToPreferOnUnaryOperation(projection, shardingRule, mesh,
+                                              hasShardedPermutationFactors);
+
+  // If one tensor can not be chosen to be common axes, return empty so it skips
+  // inserting explicit reshards for the operation.
+  if (tensorIndexToPrefer == std::nullopt) {
+    return {};
+  }
 
   // Set factor shardings to make sure factors that do not appear in the
   // preferred tensor are sharded on the other tensor.
@@ -510,28 +552,133 @@ SmallVector<AxisListRef> findCommonAxesOnUnaryOperation(
 
   // Override with the factor shardings on the preferred tensor.
   for (const auto& [factorIndex, factorSharding] :
-       projection.getTensor(tensorIndexToPrefer).factorIndexToSharding) {
+       projection.getTensor(*tensorIndexToPrefer).factorIndexToSharding) {
     factorAxisRefs[factorIndex] = AxisListRef(factorSharding.axisRefs);
   }
   return factorAxisRefs;
 }
 
-SmallVector<AxisListRef> findCommonAxes(const ShardingProjection& projection,
-                                        OpShardingRuleAttr shardingRule,
-                                        MeshAttr mesh) {
+void distributeAxisRefsToBatchingFactors(
+    ArrayRef<AxisRefAttr> axisRefsToDistribute, OpShardingRuleAttr shardingRule,
+    MeshAttr mesh, AxesPerFactor& factorCommonAxes) {
+  // TODO(enver): Instead iterate batching factors in the order of their
+  // available capacity, the one with largest available capacity being the
+  // first one to distribute `axisRefsToDistribute`. Sort first, and then
+  // iterate over sorted list.
+  for (const int64_t factorIndex : shardingRule.getBatchingFactors()) {
+    const int64_t factorSize = shardingRule.getFactorSizes()[factorIndex];
+    // Skip if a factor has size zero which could happen if the correspoinding
+    // dimension has zero size.
+    if (factorSize == 0) {
+      continue;
+    }
+    SmallVector<AxisRefAttr>& factorSharding = factorCommonAxes[factorIndex];
+    const int64_t factorShardingSize =
+        AxisListRef(factorSharding).getShardingSize(mesh);
+    // NOTE: Here, `factorSize` can be smaller than `factorShardingSize` as in
+    // some cases it is allowed to have shardings larger than its size.
+    if ((factorSize % factorShardingSize) != 0) {
+      // Skip the factor if factor size does not divide its sharding size,
+      // hence a new axis can not be appended properly.
+      continue;
+    }
+    int64_t factorCapacity = factorSize / factorShardingSize;
+    while (!axisRefsToDistribute.empty()) {
+      AxisRefAttr axisRef = axisRefsToDistribute.front();
+      const int64_t axisSize = axisRef.getSize(mesh);
+      // TODO(enver): Split `axisRef` to fit it into the batching factor's
+      // available space. The gcd of `axisSize` and `factorCapacity` should fit
+      // to the batching factor.
+      // The following check also guarantees that `factorCapacity` is not
+      // smaller than `axisSize`.
+      if (factorCapacity % axisSize != 0) {
+        break;
+      }
+      addAxisOrMerge(factorSharding, axisRef, mesh);
+
+      factorCapacity /= axisSize;
+      axisRefsToDistribute = axisRefsToDistribute.drop_front();
+    }
+    if (axisRefsToDistribute.empty()) {
+      break;
+    }
+  }
+}
+
+SmallVector<AxisListRef> findCommonAxesBeforeHandlingReplicatedFactors(
+    const ShardingProjection& projection, OpShardingRuleAttr shardingRule,
+    MeshAttr mesh, const bool hasShardedPermutationFactors) {
   // Handle the special case of unary operations without factors that need
   // replication. Reshard only one of the tensors.
   if (shardingRule.getNonScalarTensorIndices().size() == 2 &&
       shardingRule.getNeedReplicationFactors().empty()) {
-    return findCommonAxesOnUnaryOperation(projection, shardingRule, mesh);
+    return findCommonAxesOnUnaryOperation(projection, shardingRule, mesh,
+                                          hasShardedPermutationFactors);
+  }
+
+  // TODO(enver): Handle the case that tensors have sharded permutation factors.
+  if (hasShardedPermutationFactors) {
+    return {};
   }
 
   return findCommonAxesUsingMajorityVoteHeuristic(projection, shardingRule,
                                                   mesh);
+}
 
-  // TODO(enver): Distribute the greatest common prefix of shardings of factors
-  // that need replication to commonly shared factors that does not need
-  // replication.
+AxesPerFactor findCommonAxes(const ShardingProjection& projection,
+                             OpShardingRuleAttr shardingRule, MeshAttr mesh) {
+  // Return without inserting reshards if any factor sharding has overflow
+  // axes. This case is not handled yet.
+  // TODO(enver): Handle the case when factor shardings have overflow axes.
+  if (hasOverflowAxes(projection)) {
+    return {};
+  }
+
+  // Checks if factors are sharded the same way across operands and results.
+  if (hasCompatibleFactorShardings(projection, shardingRule)) {
+    return {};
+  }
+
+  SmallVector<AxisListRef> factorAxisRefs;
+  if (factorAxisRefs = findCommonAxesBeforeHandlingReplicatedFactors(
+          projection, shardingRule, mesh,
+          hasShardedPermutationFactors(projection, shardingRule));
+      factorAxisRefs.empty()) {
+    return {};
+  }
+
+  const int64_t numFactors = shardingRule.getNumFactors();
+  AxesPerFactor factorCommonAxes(numFactors);
+  for (const auto& [factorIndex, factorAxisRef] :
+       llvm::enumerate(factorAxisRefs)) {
+    factorCommonAxes[factorIndex] = factorAxisRef.toVector();
+  }
+
+  // Distribute the greatest common prefix of shardings of factors that need
+  // replication to batching factors.
+  AxesPerFactor greatestCommonPrefixShardings =
+      projection.getGreatestCommonPrefixAxes(numFactors);
+  for (const int64_t factorIndex : shardingRule.getNeedReplicationFactors()) {
+    SmallVector<AxisRefAttr> axisRefsToDistribute =
+        greatestCommonPrefixShardings[factorIndex];
+    if (shardingRule.isFactorInAllNonScalarTensors(factorIndex) &&
+        !axisRefsToDistribute.empty()) {
+      // TODO(enver): Instead of the greatest common prefix, explore options
+      // to distribute more.
+      distributeAxisRefsToBatchingFactors(axisRefsToDistribute, shardingRule,
+                                          mesh, factorCommonAxes);
+    }
+  }
+
+  return factorCommonAxes;
+}
+
+bool shouldReshard(TensorShardingAttr sourceSharding,
+                   TensorShardingAttr targetSharding) {
+  if (isFullyReplicated(sourceSharding) && isFullyReplicated(targetSharding)) {
+    return false;
+  }
+  return sourceSharding != targetSharding;
 }
 
 struct InsertExplicitReshardsPass
@@ -568,11 +715,7 @@ struct InsertExplicitReshardsPass
               getFuncResultSharding(funcOp, index);
           TensorShardingAttr operandSharding =
               getOrCreateSharding(operand, *meshName, /*closedIfMissing=*/true);
-          if (isFullyReplicated(operandSharding) &&
-              isFullyReplicated(funcResultSharding)) {
-            continue;
-          }
-          if (funcResultSharding != operandSharding) {
+          if (shouldReshard(operandSharding, funcResultSharding)) {
             // TODO(enver): Close all shardings and drop replicated axes before
             // this pass on the export pipeline.
             auto reshardOp = rewriter.create<ReshardOp>(
@@ -581,6 +724,34 @@ struct InsertExplicitReshardsPass
                     ? funcResultSharding
                     : TensorShardingAttr::getFullyClosedLike(operandSharding));
             opOperand.set(reshardOp);
+          }
+        }
+        return;
+      }
+
+      // TODO(enver): Prefer resharding the owner when multiple sources are
+      // sharded in the same way.
+      if (auto shardableDataFlowOp =
+              dyn_cast<ShardableDataFlowOpInterface>(op)) {
+        for (Value owner : llvm::concat<Value>(
+                 shardableDataFlowOp.getOpResultEdgeOwners(),
+                 shardableDataFlowOp.getBlockArgumentEdgeOwners())) {
+          TensorShardingAttr ownerSharding =
+              shardableDataFlowOp.getEdgeOwnerSharding(owner);
+          for (OpOperand* sourceOpOperand :
+               shardableDataFlowOp.getEdgeSources(owner)) {
+            Value source = sourceOpOperand->get();
+            TensorShardingAttr sourceSharding = getOrCreateSharding(
+                source, *meshName, /*closedIfMissing=*/true);
+            if (shouldReshard(sourceSharding, ownerSharding)) {
+              rewriter.setInsertionPointAfterValue(source);
+              auto reshardOp = rewriter.create<ReshardOp>(
+                  source.getLoc(), source,
+                  ownerSharding
+                      ? ownerSharding
+                      : TensorShardingAttr::getFullyClosedLike(sourceSharding));
+              sourceOpOperand->set(reshardOp);
+            }
           }
         }
         return;
@@ -603,31 +774,17 @@ struct InsertExplicitReshardsPass
       ShardingProjection shardingProjection = ShardingProjection::build(
           op, shardingRule, mesh, /*closedIfMissing=*/true);
 
-      // Return without inserting reshards if any factor sharding has overflow
-      // axes. This case is not handled yet.
-      // TODO(enver): Handle the case when factor shardings have overflow axes.
-      if (hasOverflowAxes(shardingProjection)) {
-        return;
-      }
-
       // Return without inserting reshards for operations with special
       // dimensions.
       // TODO(enver): Insert explicit reshards if special dimensions are
       // unsharded.
       // TODO(enver): Add need replication factors to fft.
-      if (isa<stablehlo::ReverseOp, stablehlo::DynamicSliceOp,
-              stablehlo::DynamicUpdateSliceOp, stablehlo::PadOp,
-              stablehlo::SliceOp, stablehlo::FftOp, stablehlo::ReduceWindowOp,
-              stablehlo::ScatterOp, stablehlo::SelectAndScatterOp,
-              stablehlo::GatherOp, stablehlo::ConvolutionOp,
-              stablehlo::CustomCallOp, stablehlo::AllReduceOp,
-              stablehlo::AllGatherOp, stablehlo::AllToAllOp,
-              stablehlo::CollectivePermuteOp>(op)) {
-        return;
-      }
-
-      // Checks if factors are sharded the same way across operands and results.
-      if (hasCompatibleFactorShardings(shardingProjection, shardingRule)) {
+      if (isa<stablehlo::DynamicSliceOp, stablehlo::DynamicUpdateSliceOp,
+              stablehlo::FftOp, stablehlo::ReduceWindowOp, stablehlo::ScatterOp,
+              stablehlo::SelectAndScatterOp, stablehlo::GatherOp,
+              stablehlo::ConvolutionOp, stablehlo::CustomCallOp,
+              stablehlo::AllReduceOp, stablehlo::AllGatherOp,
+              stablehlo::AllToAllOp, stablehlo::CollectivePermuteOp>(op)) {
         return;
       }
 
@@ -637,8 +794,8 @@ struct InsertExplicitReshardsPass
                findCommonAxes(shardingProjection, shardingRule, mesh))) {
         // TODO(enver): Add unit tests to test overflow axes are cleared after
         // handling the case that some factors have overflow axes.
-        updateTensorShardings |= shardingProjection.updateSharding(
-            index, axes.toVector(), /*overflowAxes=*/{});
+        updateTensorShardings |=
+            shardingProjection.updateSharding(index, axes, /*overflowAxes=*/{});
       }
 
       insertExplicitReshards(op, shardingProjection, updateTensorShardings,

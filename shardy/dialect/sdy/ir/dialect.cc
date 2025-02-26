@@ -49,6 +49,7 @@ limitations under the License.
 #include "shardy/dialect/sdy/ir/constants.h"
 #include "shardy/dialect/sdy/ir/enums.cc.inc"
 #include "shardy/dialect/sdy/ir/extensions/stablehlo_extensions.h"
+#include "shardy/dialect/sdy/ir/enums.h"
 #include "shardy/dialect/sdy/ir/parsers.h"   // IWYU pragma: keep
 #include "shardy/dialect/sdy/ir/printers.h"  // IWYU pragma: keep
 #include "shardy/dialect/sdy/ir/utils.h"
@@ -121,18 +122,22 @@ namespace {
 // terminator.
 // Else returns an empty vector.
 template <typename RegionOpTy>
-SmallVector<Value> getEdgeSourcesFromRegionBasedOp(Value owner, RegionOpTy op) {
+SmallVector<OpOperand*> getEdgeSourcesFromRegionBasedOp(Value owner,
+                                                        RegionOpTy op) {
   static_assert(
       OpTrait::template hasSingleBlockImplicitTerminator<RegionOpTy>::value);
   assert(getOwningOp(owner) == op.getOperation());
-  return TypeSwitch<Value, SmallVector<Value>>(owner)
-      .Case<BlockArgument>([op](BlockArgument blockArg) -> SmallVector<Value> {
-        return {op->getOperand(blockArg.getArgNumber())};
-      })
-      .template Case<OpResult>([op](OpResult opResult) -> SmallVector<Value> {
-        return {getBodyTerminatorOperand(op, opResult.getResultNumber())};
-      })
-      .Default([](Value _) -> SmallVector<Value> { return {}; });
+  return TypeSwitch<Value, SmallVector<OpOperand*>>(owner)
+      .Case<BlockArgument>(
+          [op](BlockArgument blockArg) -> SmallVector<OpOperand*> {
+            return {&op->getOpOperand(blockArg.getArgNumber())};
+          })
+      .template Case<OpResult>(
+          [op](OpResult opResult) -> SmallVector<OpOperand*> {
+            return {
+                &getBodyTerminatorOpOperands(op)[opResult.getResultNumber()]};
+          })
+      .Default([](Value _) -> SmallVector<OpOperand*> { return {}; });
 }
 
 // Returns the edge owner given a `source`.
@@ -436,6 +441,22 @@ bool AxisRefAttr::overlaps(AxisRefAttr other) const {
          otherSubAxisInfo.getPreSize() < thisSubAxisInfo.getNextPreSize();
 }
 
+namespace {
+
+bool canSubAxesCoexist(int64_t minPreSize, int64_t maxPreSize,
+                       int64_t minNextPreSize, int64_t maxNextPreSize) {
+  if (minNextPreSize > maxPreSize) {
+    // Sub-axes overlap, check if overlapping and non-overlapping parts are
+    // valid.
+    return minNextPreSize % maxPreSize == 0 && maxPreSize % minPreSize == 0 &&
+           maxNextPreSize % minNextPreSize == 0;
+  }
+  // Sub-axes don't overlap, check if the gap is valid.
+  return maxPreSize % minNextPreSize == 0;
+}
+
+}  // namespace
+
 bool AxisRefAttr::canCoexist(AxisRefAttr other) const {
   if (getName() != other.getName()) {
     return true;
@@ -457,31 +478,46 @@ bool AxisRefAttr::canCoexist(AxisRefAttr other) const {
   auto [minNextPreSize, maxNextPreSize] =
       std::minmax(thisNextPreSize, otherNextPreSize);
 
-  if (minNextPreSize > maxPreSize) {
-    // Sub-axes overlap, check if overlapping and non-overlapping parts are
-    // valid.
-    return minNextPreSize % maxPreSize == 0 && maxPreSize % minPreSize == 0 &&
-           maxNextPreSize % minNextPreSize == 0;
-  }
-  // Sub-axes don't overlap, check if the gap is valid.
-  return maxPreSize % minNextPreSize == 0;
+  return canSubAxesCoexist(minPreSize, maxPreSize, minNextPreSize,
+                           maxNextPreSize);
 }
 
-std::optional<AxisRefAttr> AxisRefAttr::getPrefixWithOverlap(
-    AxisRefAttr other, MeshAttr mesh) const {
-  int64_t thisPreSize = getSubAxisPreSize();
-  if (!canCoexist(other) || !overlaps(other) ||
-      other.getSubAxisPreSize() > thisPreSize) {
+std::optional<AxisRefAttr> AxisRefAttr::getOverlap(AxisRefAttr other) const {
+  if (other.getName() != getName()) {
     return std::nullopt;
   }
-  if (other.contains(*this)) {
+
+  SubAxisInfoAttr thisSubAxisInfo = getSubAxisInfo();
+  SubAxisInfoAttr otherSubAxisInfo = other.getSubAxisInfo();
+
+  if (!thisSubAxisInfo) {
+    // This is a full axis.
+    return other;
+  }
+
+  if (!otherSubAxisInfo) {
+    // Other is a full axis.
     return *this;
   }
-  int64_t thisNextPreSize = getNextPreSizeOrFullSize(mesh);
-  int64_t otherNextPreSize = other.getNextPreSizeOrFullSize(mesh);
-  return AxisRefAttr::get(
-      getContext(), getName(), thisPreSize,
-      std::min(thisNextPreSize, otherNextPreSize) / thisPreSize);
+
+  int64_t thisPreSize = thisSubAxisInfo.getPreSize();
+  int64_t otherPreSize = otherSubAxisInfo.getPreSize();
+  int64_t thisNextPreSize = thisSubAxisInfo.getNextPreSize();
+  int64_t otherNextPreSize = otherSubAxisInfo.getNextPreSize();
+
+  auto [minPreSize, maxPreSize] = std::minmax(thisPreSize, otherPreSize);
+  auto [minNextPreSize, maxNextPreSize] =
+      std::minmax(thisNextPreSize, otherNextPreSize);
+
+  if (minNextPreSize <= maxPreSize ||
+      !canSubAxesCoexist(minPreSize, maxPreSize, minNextPreSize,
+                         maxNextPreSize)) {
+    // No overlap or can't co-exist.
+    return std::nullopt;
+  }
+
+  return AxisRefAttr::get(getContext(), getName(), maxPreSize,
+                          minNextPreSize / maxPreSize);
 }
 
 std::optional<AxisRefAttr> AxisRefAttr::getPrefixWithoutOverlap(
@@ -554,14 +590,6 @@ std::optional<AxisRefAttr> AxisRefAttr::getGreatestCommonPrefix(
     return other;
   }
   return std::nullopt;
-}
-
-std::optional<AxisRefAttr> AxisRefAttr::removeCommonPrefix(
-    AxisRefAttr prefix, MeshAttr mesh) const {
-  if (!prefix.strictPrefixOf(*this)) {
-    return std::nullopt;
-  }
-  return getSuffixWithoutOverlap(prefix, mesh);
 }
 
 //===----------------------------------------------------------------------===//
@@ -923,12 +951,33 @@ SmallVector<int64_t> OpShardingRuleAttr::getTensorSizes() const {
   return tensorSizes;
 }
 
+FactorType OpShardingRuleAttr::getFactorType(int64_t factorIndex) const {
+  if (isReductionFactor(factorIndex)) {
+    return FactorType::kReduction;
+  }
+  if (isNeedReplicationFactor(factorIndex)) {
+    return FactorType::kNeedReplication;
+  }
+  if (isPermutationFactor(factorIndex)) {
+    return FactorType::kPermutation;
+  }
+  return FactorType::kPassThrough;
+}
+
+bool OpShardingRuleAttr::isPassThroughFactor(int64_t factorIndex) const {
+  return getFactorType(factorIndex) == FactorType::kPassThrough;
+}
+
 bool OpShardingRuleAttr::isReductionFactor(int64_t factorIndex) const {
   return llvm::is_contained(getReductionFactors(), factorIndex);
 }
 
 bool OpShardingRuleAttr::isNeedReplicationFactor(int64_t factorIndex) const {
   return llvm::is_contained(getNeedReplicationFactors(), factorIndex);
+}
+
+bool OpShardingRuleAttr::isPermutationFactor(int64_t factorIndex) const {
+  return llvm::is_contained(getPermutationFactors(), factorIndex);
 }
 
 bool OpShardingRuleAttr::isFactorInAllNonScalarTensors(
@@ -948,8 +997,7 @@ bool OpShardingRuleAttr::isFactorInAllNonScalarTensors(
 }
 
 bool OpShardingRuleAttr::isBatchingFactor(int64_t factorIndex) const {
-  return !isReductionFactor(factorIndex) &&
-         !isNeedReplicationFactor(factorIndex) &&
+  return isPassThroughFactor(factorIndex) &&
          isFactorInAllNonScalarTensors(factorIndex);
 }
 
@@ -964,6 +1012,18 @@ SmallVector<int64_t> OpShardingRuleAttr::getNonScalarTensorIndices() const {
     }
   }
   return nonScalarTensorIndices;
+}
+
+// TODO(enver): Consider returning a BitVector for batching factors.
+SmallVector<int64_t> OpShardingRuleAttr::getBatchingFactors() const {
+  SmallVector<int64_t> factorIndices;
+  factorIndices.reserve(getNumFactors());
+  for (int64_t index = 0; index < getNumFactors(); index++) {
+    if (isBatchingFactor(index)) {
+      factorIndices.push_back(index);
+    }
+  }
+  return factorIndices;
 }
 
 //===----------------------------------------------------------------------===//
@@ -1129,7 +1189,7 @@ ResultRange ManualComputationOp::getOpResultEdgeOwners() {
 // ```
 // If the owner is a block argument (e.g., `%operand0`), return `%arg0`.
 // If the owner is a result (e.g., `%r`), return `%a`.
-SmallVector<Value> ManualComputationOp::getEdgeSources(Value owner) {
+SmallVector<OpOperand*> ManualComputationOp::getEdgeSources(Value owner) {
   return getEdgeSourcesFromRegionBasedOp(owner, *this);
 }
 
@@ -1236,7 +1296,12 @@ TensorShardingAttr DataFlowEdgeOp::transformTargetSharding(
 }
 
 SmallVector<Value> DataFlowEdgeOp::getSources() {
-  return castOwningShardableDataFlowOp(getInput()).getEdgeSources(getInput());
+  SmallVector<Value> sources;
+  for (OpOperand* opOperand :
+       castOwningShardableDataFlowOp(getInput()).getEdgeSources(getInput())) {
+    sources.push_back(opOperand->get());
+  }
+  return sources;
 }
 
 SmallVector<Value> DataFlowEdgeOp::getNonOwnerTargets() {
@@ -1296,7 +1361,7 @@ ResultRange NamedComputationOp::getOpResultEdgeOwners() { return getResults(); }
 // ```
 // If the owner is a block argument (e.g., `%operand0`), return `%arg0`.
 // If the owner is a result (e.g., `%r`), return `%a`.
-SmallVector<Value> NamedComputationOp::getEdgeSources(Value owner) {
+SmallVector<OpOperand*> NamedComputationOp::getEdgeSources(Value owner) {
   return getEdgeSourcesFromRegionBasedOp(owner, *this);
 }
 
@@ -1327,6 +1392,14 @@ LogicalResult NamedComputationOp::inferReturnTypes(
              std::back_inserter(inferredReturnTypes));
   return success();
 }
+
+//===----------------------------------------------------------------------===//
+// CollectivePermuteOp
+//===----------------------------------------------------------------------===//
+
+bool CollectivePermuteOp::allowDifferentMeshes() { return true; }
+
+Type CollectivePermuteOp::getType() { return getResult().getType(); }
 
 }  // namespace sdy
 }  // namespace mlir

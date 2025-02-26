@@ -46,12 +46,14 @@ struct PropagationOptions {
   // Whether to save debug information about the sharding origins on the module.
   bool debugShardingOrigins = false;
   // Whether to save debug information about the edge shardings on the module.
-  bool debugEdgeSourceSharding = false;
+  bool debugPropagationEdgeSharding = false;
   // Whether to avoid converting `sdy::ShardingConstraintOp` to
   // `sdy::ReshardOp`.
   bool skipConvertToReshard = false;
   // Whether to skip inlining in the module.
   bool skipInline = false;
+  // Whether to enable inserting explicit collectives.
+  bool enableInsertExplicitCollectives = false;
 };
 
 // Adds the SDY propagation pass, preceded by a sequence of import passes needed
