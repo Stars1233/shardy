@@ -140,6 +140,13 @@ int64_t getTotalAxesSize(ArrayRef<MeshAxisAttr> axes) {
       [](int64_t cur, MeshAxisAttr axis) { return cur * axis.getSize(); });
 }
 
+int64_t getTotalAxesSize(ArrayRef<AxisRefAttr> axes, MeshAttr mesh) {
+  return std::accumulate(axes.begin(), axes.end(), 1,
+                         [mesh](int64_t cur, AxisRefAttr axis) {
+                           return cur * axis.getSize(mesh);
+                         });
+}
+
 MeshOp getMeshOp(Operation* op, SymbolRefAttr meshSymName) {
   return SymbolTable::lookupNearestSymbolFrom<sdy::MeshOp>(
       op, meshSymName);
@@ -265,6 +272,26 @@ std::string factorSymbolString(int64_t factor) {
     return std::string(1, 'i' + factor);
   }
   return "z_" + std::to_string(factor - kStartAtZ);
+}
+
+void sortAndMergeAxes(SmallVector<AxisRefAttr>& axes, MeshAttr mesh) {
+  if (axes.empty()) {
+    return;
+  }
+
+  llvm::sort(axes, AxisRefAttr::getMeshComparator(mesh));
+
+  auto* current = axes.begin();
+  for (auto* next = current + 1; next != axes.end(); ++next) {
+    assert(!current->overlaps(*next) && "Axes should not overlap");
+    if (current->canMerge(*next)) {
+      *current = current->merge(*next, mesh);
+    } else {
+      current++;
+      *current = *next;
+    }
+  }
+  axes.erase(current + 1, axes.end());
 }
 
 Operation* getOwningOp(Value value) {
@@ -572,7 +599,7 @@ ArrayRef<AxisRefAttr>::const_iterator getFirstFreeAxisIter(
 SmallVector<AxisRefAttr> getAxisSetDiff(ArrayRef<AxisRefAttr> axesA,
                                         ArrayRef<AxisRefAttr> axesB,
                                         MeshAttr mesh) {
-  if (axesA.empty()) {
+  if (axesA.empty() || axesA == axesB) {
     return {};
   }
   if (axesB.empty()) {
