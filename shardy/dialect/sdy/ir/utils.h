@@ -100,6 +100,9 @@ int64_t isScalar(Value value);
 // Returns the product of the given mesh axis sizes.
 int64_t getTotalAxesSize(ArrayRef<MeshAxisAttr> axes);
 
+// Returns the product of the given axis sizes from the given mesh.
+int64_t getTotalAxesSize(ArrayRef<AxisRefAttr> axes, MeshAttr mesh);
+
 // Looks up the mesh symbol with the given `meshName` in `symbolTable`, and
 // returns it if it exists in the table, or nullptr otherwise.
 MeshOp getMeshOp(const SymbolTable& symbolTable, StringRef meshName);
@@ -234,6 +237,10 @@ void addAxisOrMerge(Container& container, AxisRefAttr axis, MeshAttr mesh) {
     container.push_back(axis);
   }
 }
+
+// Sorts `axes` by `mesh`s comparator, and merges axes that can be merged.
+// Assumes that there is no overlap between elements in `axes`.
+void sortAndMergeAxes(SmallVector<AxisRefAttr>& axes, MeshAttr mesh);
 
 // Returns the defining op of `value`, if it's an op result, or the parent op
 // if it's a block argument.
@@ -482,6 +489,14 @@ ArrayRef<AxisRefAttr>::const_iterator getFirstFreeAxisIter(
 SmallVector<AxisRefAttr> getAxisSetDiff(ArrayRef<AxisRefAttr> axesA,
                                         ArrayRef<AxisRefAttr> axesB,
                                         MeshAttr mesh);
+
+// Returns true if `op` is only used by ops of the specified types.
+template <class... OpTys>
+bool hasOnlyUsersOfType(Operation* op) {
+  return llvm::all_of(op->getUsers(), [](Operation* user) {
+    return mlir::isa<OpTys...>(user);
+  });
+}
 
 }  // namespace sdy
 }  // namespace mlir

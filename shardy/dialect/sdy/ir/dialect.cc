@@ -49,7 +49,6 @@ limitations under the License.
 #include "mlir/Transforms/InliningUtils.h"
 #include "shardy/dialect/sdy/ir/bytecode.h"
 #include "shardy/dialect/sdy/ir/constants.h"
-#include "shardy/dialect/sdy/ir/enums.cc.inc"
 #include "shardy/dialect/sdy/ir/enums.h"
 #include "shardy/dialect/sdy/ir/extensions/stablehlo_extensions.h"
 #include "shardy/dialect/sdy/ir/parsers.h"   // IWYU pragma: keep
@@ -868,12 +867,14 @@ TensorShardingAttr TensorShardingAttr::getClosedLike(
   }
   return TensorShardingAttr::get(sharding.getContext(), sharding.getMeshOrRef(),
                                  /*dimShardings=*/closedDimShardings,
-                                 /*replicatedAxes=*/{}, /*unreducedAxes=*/{});
+                                 /*replicatedAxes=*/{},
+                                 sharding.getUnreducedAxes());
 }
 
 TensorShardingAttr TensorShardingAttr::getClosed(
     MLIRContext* context, Attribute meshOrRef,
-    ArrayRef<SmallVector<AxisRefAttr>> axesPerDim) {
+    ArrayRef<SmallVector<AxisRefAttr>> axesPerDim,
+    ArrayRef<AxisRefAttr> unreducedAxes) {
   SmallVector<DimensionShardingAttr> dimShardings;
   dimShardings.reserve(axesPerDim.size());
   for (ArrayRef<AxisRefAttr> axes : axesPerDim) {
@@ -881,7 +882,7 @@ TensorShardingAttr TensorShardingAttr::getClosed(
         DimensionShardingAttr::get(context, axes, /*is_closed=*/true));
   }
   return TensorShardingAttr::get(context, meshOrRef, dimShardings,
-                                 /*replicatedAxes=*/{}, /*unreducedAxes=*/{});
+                                 /*replicatedAxes=*/{}, unreducedAxes);
 }
 
 TensorShardingAttr TensorShardingAttr::getFullyOpen(MLIRContext* context,
@@ -1262,6 +1263,8 @@ void ManualComputationOp::setOpResultEdgeOwnerShardings(
 TensorShardingAttr ManualComputationOp::transformTargetSharding(
     Value target, TensorShardingAttr sharding,
     DataFlowShardingTransformType transformType) {
+  // We always expect a target sharding.
+  assert(sharding);
   switch (transformType) {
     case DataFlowShardingTransformType::kBeforeEdgePropagation: {
       if (auto blockArg = dyn_cast<BlockArgument>(target)) {
@@ -1549,6 +1552,7 @@ Type ReduceScatterOp::getType() { return getResult().getType(); }
 }  // namespace mlir
 
 #include "shardy/dialect/sdy/ir/dialect.cc.inc"
+#include "shardy/dialect/sdy/ir/enums.cc.inc"
 #define GET_ATTRDEF_CLASSES
 #include "shardy/dialect/sdy/ir/attrs.cc.inc"
 #define GET_OP_INTERFACE_CLASSES

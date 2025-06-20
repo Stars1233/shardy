@@ -2,6 +2,23 @@
 
 sdy.mesh @mesh = <["a"=2, "b"=2]>
 
+// Without prioritizing host offload ops first, the first move to host will
+// have argument sharding, but movetodevice would have result sharding.
+// CHECK-LABEL: func @element_wise_host_offload_first(
+// CHECK-SAME:      %arg0: tensor<8x8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"a", ?}, {?}]>}
+// CHECK-SAME:  -> (tensor<8x8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{?}, {"a", ?}]>}) {
+func.func @element_wise_host_offload_first(%arg0: tensor<8x8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"a", ?}, {?}]>}) -> (tensor<8x8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{?}, {"a", ?}]>}) {
+  // CHECK:      %1 = stablehlo.custom_call @MoveToHost(%0) {backend_config = "", sdy.sharding = #sdy.sharding_per_value<[<@mesh, [[[SOME_SHARDING:.*]]]>]>} : (tensor<8x8xf32>) -> tensor<8x8xf32>
+  // CHECK-NEXT: %2 = stablehlo.custom_call @MoveToDevice(%1) {backend_config = "", sdy.sharding = #sdy.sharding_per_value<[<@mesh, [[[SOME_SHARDING]]]>]>} : (tensor<8x8xf32>) -> tensor<8x8xf32>
+  // CHECK-NEXT: %3 = stablehlo.add %2, %2 {sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{?}, {"a", ?}]>]>} : tensor<8x8xf32>
+  // CHECK-NEXT: return %3 : tensor<8x8xf32>
+  %0 = stablehlo.add %arg0, %arg0 : tensor<8x8xf32>
+  %1 = stablehlo.custom_call @MoveToHost(%0) {backend_config = ""} : (tensor<8x8xf32>) -> tensor<8x8xf32>
+  %2 = stablehlo.custom_call @MoveToDevice(%1) {backend_config = ""} : (tensor<8x8xf32>) -> tensor<8x8xf32>
+  %3 = stablehlo.add %2, %2 : tensor<8x8xf32>
+  return %3 : tensor<8x8xf32>
+}
+
 // Without prioritizing element-wise ops first, the sharding on dim 0 would
 // have been propagated first.
 // CHECK-LABEL: func @element_wise_over_dot_general(
@@ -221,6 +238,24 @@ func.func @pass_through_factor_higher_priority_than_reduction_factor(
   // CHECK-NEXT: return %[[DOT]] : tensor<32x16xf32>
   %0 = stablehlo.dot %arg0, %arg1, precision = [DEFAULT, DEFAULT] : (tensor<32x1024xf32>, tensor<1024x16xf32>) -> tensor<32x16xf32>
   return %0 : tensor<32x16xf32>
+}
+
+// CHECK-LABEL: func @unreduced_axes_block_bwd_propagation(
+// CHECK-SAME:      %arg0: tensor<8x8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"a"}, {"b"}]>},
+// CHECK-SAME:      %arg1: tensor<8x16xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"b", ?}, {?}]>})
+// CHECK-SAME:  -> (tensor<8x16xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"a", ?}, {"b"}]>}) {
+func.func @unreduced_axes_block_bwd_propagation(
+    %arg0: tensor<8x8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"a"}, {"b"}]>},
+    %arg1: tensor<8x16xf32>)
+    -> (tensor<8x16xf32> {sdy.sharding = #sdy.sharding<@mesh, [{?}, {"b"}]>}) {
+  // CHECK-NEXT: %[[DOT_GENERAL:.*]] = stablehlo.dot_general %arg0, %arg1
+  // CHECK-SAME:   {sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{"a", ?}, {?}], unreduced={"b"}>]>}
+  // CHECK-NEXT: stablehlo.add %[[DOT_GENERAL]], %[[DOT_GENERAL]] {sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{"a", ?}, {"b", ?}]>]>}
+  %0 = stablehlo.dot_general %arg0, %arg1, contracting_dims = [1] x [0]
+    {sdy.sharding = #sdy.sharding_per_value<[<@mesh, [{?}, {?}], unreduced={"b"}>]>} :
+    (tensor<8x8xf32>, tensor<8x16xf32>) -> tensor<8x16xf32>
+  %1 = stablehlo.add %0, %0 : tensor<8x16xf32>
+  return %1 : tensor<8x16xf32>
 }
 
 // CHECK-LABEL: func @broadcast_forward_higher_priority_than_backwards
